@@ -126,6 +126,12 @@ Tight recaps so we can revisit. Most detail is in chat history + ARCHITECTURE.md
   `subscriptions-transport-ws`.
 - This is why the server must be long-lived (not serverless).
 
+### L5 — ORM: Prisma vs Drizzle
+- Both = type-safe DB layer in TS (pick one). Prisma = object-style, own schema
+  file + codegen, easy, hides SQL. Drizzle = SQL-style builder, thin/fast, plain
+  TS schema, edge-friendly, need to know SQL.
+- furnace-app uses **Prisma** (doc plan, long-lived server, easy for learning).
+
 ### L4 — Express layering: route → controller → service (+ middleware)
 - **route** = path+method (the door). **controller** = HTTP glue (req/res).
   **service** = pure logic, no req/res. **middleware** = cross-cutting guard.
@@ -158,7 +164,13 @@ Pieces:
   so a mutation is fine — the OAuth `/auth/*` HTTP routes come later)
 - auth context: verify `Authorization: Bearer <jwt>` on each request → `me`
 
-Later: swap fake store → Prisma `User` table.
+Later: swap fake store → real `users` table.
+
+**DB choice (2026-06-30): Drizzle + Neon** (changed from Prisma). Files:
+`src/db/schema.ts` (tables), `src/db/index.ts` (client), `drizzle.config.ts`.
+`npx drizzle-kit push` to sync. Use `db.insert/select` in services.
+⚠️ `docs/ARCHITECTURE.md` schema is still written in **Prisma syntax** — needs a
+pass to convert to Drizzle (logic/columns identical, just syntax).
 
 ## Open questions / next up
 
