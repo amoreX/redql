@@ -1,4 +1,5 @@
 import express from "express";
+import morgan from "morgan";
 import { ApolloServer } from "@apollo/server";
 import bodyParser from "body-parser";
 import { expressMiddleware } from "@as-integrations/express5";
@@ -14,6 +15,7 @@ const app = express();
 const apserver = new ApolloServer({ typeDefs, resolvers });
 await apserver.start();
 
+app.use(morgan("dev"));
 app.use(bodyParser.json());
 app.use("/graphql", expressMiddleware(apserver));
 app.use("/api", router);
