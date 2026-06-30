@@ -1,10 +1,11 @@
-import { Request, Response } from "express";
+import type { Request, Response } from "express";
 import { signup, login } from "../services/auth.services.js";
+
 export const signupController = async (req: Request, res: Response) => {
   try {
     const { email, password } = req.body;
     const result = await signup(email, password);
-    res.status(201).json({ result: result.result, message: result.message });
+    res.status(result.result ? 201 : 400).json(result);
   } catch (err: any) {
     res.status(500).json({ error: err.message ?? "Server Error" });
   }
@@ -14,7 +15,7 @@ export const loginController = async (req: Request, res: Response) => {
   try {
     const { email, password } = req.body;
     const result = await login(email, password);
-    res.status(201).json({ result: result.result, message: result.message });
+    res.status(result.result ? 200 : 401).json(result);
   } catch (err: any) {
     res.status(500).json({ error: err.message ?? "Server Error" });
   }
