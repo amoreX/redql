@@ -44,3 +44,10 @@ export const entries = pgTable("entries", {
   createdAt: timestamp("created_at").defaultNow().notNull(),
   data: jsonb("data").notNull(), // jsonb to match varying type of content
 });
+
+// Types derived straight from the schema (no hand-writing).
+// $inferSelect = row you READ back. $inferInsert = shape you pass to INSERT.
+export type Session = typeof sessions.$inferSelect;
+export type NewSession = typeof sessions.$inferInsert;
+export type Entry = typeof entries.$inferSelect;
+export type NewEntry = typeof entries.$inferInsert;
