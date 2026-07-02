@@ -26,6 +26,7 @@
   "dependencies": {
     "@apollo/server": "^5.5.1",
     "@as-integrations/express5": "^1.1.2",
+    "@graphql-tools/schema": "^10.0.34",
     "@neondatabase/serverless": "^1.1.0",
     "axios": "^1.16.0",
     "bcryptjs": "^3.0.3",
@@ -36,8 +37,11 @@
     "express": "^5.2.1",
     "graphql": "^16.14.0",
     "graphql-scalars": "^1.25.0",
+    "graphql-subscriptions": "^3.0.0",
+    "graphql-ws": "^6.0.8",
     "jsonwebtoken": "^9.0.3",
     "morgan": "^1.11.0",
+    "openai": "^6.45.0",
     "ws": "^8.21.0"
   }
 }

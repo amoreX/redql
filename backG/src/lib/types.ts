@@ -5,8 +5,17 @@ import {
   listSessions,
   getSession,
   getActivePath,
-  runEchoTurn,
+  runStreamingTurn,
 } from "../services/sessions.services.js";
+import { pubsub, tokensTopic } from "./pubsub.js";
+
+// Curated model list for the client's picker (MVP). Don't let a client pick an
+// arbitrary/expensive model. (later: proxy OpenRouter /models.)
+const MODELS = [
+  { id: "anthropic/claude-sonnet-4.5", name: "Claude Sonnet 4.5" },
+  { id: "anthropic/claude-3.5-haiku", name: "Claude 3.5 Haiku" },
+  { id: "openai/gpt-4o-mini", name: "GPT-4o mini" },
+];
 
 // The per-request context, produced by the context fn in index.ts (from the JWT).
 // userId is null when the request has no valid Bearer token.
@@ -64,15 +73,32 @@ export const typeDefs = `#graphql
     data: JSON!
   }
 
+  type Model {
+    id: ID!
+    name: String!
+  }
+
+  type TokenChunk {
+    sessionId: ID!
+    delta: String!
+    done: Boolean!
+    entryId: ID
+  }
+
   type Query {
     sessions: [Session!]!
     session(id: ID!): Session
     activePath(sessionId: ID!): [Entry!]!
+    models: [Model!]!
   }
 
   type Mutation {
     createSession(cwd: String!, title: String): Session!
-    sendMessage(sessionId: ID!, content: String!): [Entry!]!
+    sendMessage(sessionId: ID!, content: String!, model: String): Entry!
+  }
+
+  type Subscription {
+    tokenStream(sessionId: ID!): TokenChunk!
   }
 `;
 
@@ -100,6 +126,9 @@ export const resolvers = {
       await requireOwnedSession(sessionId, userId);
       return getActivePath(sessionId);
     },
+
+    // Curated model list for the client's model picker.
+    models: () => MODELS,
   },
 
   Mutation: {
@@ -109,16 +138,20 @@ export const resolvers = {
       ctx: GqlContext,
     ) => createSession(requireUser(ctx), cwd, title),
 
-    // Echo MVP: one batched transaction (ownership + both appends + activePath).
-    // Service throws plain codes; map them to GraphQL errors here.
+    // Fire-and-stream: persist the user msg, kick off the streaming turn, return
+    // the USER entry immediately. The assistant streams over `tokenStream`.
     sendMessage: async (
       _parent: unknown,
-      { sessionId, content }: { sessionId: string; content: string },
+      {
+        sessionId,
+        content,
+        model,
+      }: { sessionId: string; content: string; model?: string },
       ctx: GqlContext,
     ) => {
       const userId = requireUser(ctx);
       try {
-        return await runEchoTurn(sessionId, userId, content);
+        return await runStreamingTurn(sessionId, userId, content, model);
       } catch (err) {
         const code = err instanceof Error ? err.message : "";
         if (code === "SESSION_NOT_FOUND")
@@ -131,6 +164,21 @@ export const resolvers = {
           });
         throw err;
       }
+    },
+  },
+
+  Subscription: {
+    // Relay tokens for a session's turn. Auth via ctx (WS connectionParams → userId).
+    tokenStream: {
+      subscribe: async (
+        _parent: unknown,
+        { sessionId }: { sessionId: string },
+        ctx: GqlContext,
+      ) => {
+        const userId = requireUser(ctx);
+        await requireOwnedSession(sessionId, userId);
+        return pubsub.asyncIterableIterator(tokensTopic(sessionId));
+      },
     },
   },
 };

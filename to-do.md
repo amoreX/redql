@@ -1,71 +1,52 @@
 # furnace-app — TO-DO
 
-> Working checklist. The current focus (**Sessions / Chats**) is broken into small
-> steps. Later topics are just titles — we elaborate them when we get there.
-> Auth (signup/login/JWT) is ✅ done — see `claude_session.md`.
+> Working checklist. Later topics are just titles — we elaborate them when we get there.
+> Auth ✅, Sessions/Chats ✅, LLM + Streaming ✅ done — see `claude_session.md`.
 
 ---
 
-## 🟢 NOW: Sessions / Chats
+## 🟢 NOW: (next topic — pick one to elaborate)
 
-The chat data layer + making GraphQL real. Sits on furnace's entry-tree
-(`Session ──< Entry`). Reference: `docs/ARCHITECTURE.md` §4.1 + §5.2, and furnace
-`src/session/store.ts` / `types.ts`.
+Likely next: **Tool dispatch to device** (`toolDispatch` / `submitToolResult`) —
+the split-runtime piece where the model's tool calls run on the user's Mac.
 
-### 1. Conversation tables (Drizzle, 1:1 furnace)
-- [x] In `src/db/schema.ts` add **`sessions`** table — furnace columns:
-      `id, title, cwd, activeLeafId, parentSessionId, forkedFromEntryId,
-      createdAt, updatedAt, archivedAt` + scoping `userId` (ref `users.id`).
-      *(project/device scoping = later topic; for now just `userId` + `cwd`.)*
-- [x] Add **`entries`** table: `id, sessionId (ref sessions), parentEntryId,
-      type, role, createdAt, data` (data = `jsonb`).
-- [x] Entry `type`/`role`: start as plain `text()` (furnace stores text). Optional
-      later: drizzle `pgEnum`.
-- [x] `npx drizzle-kit push` → pick **create**, keep `schemaFilter:["public"]`.
-- [ ] (optional) drizzle `relations()` for `db.query.*` — skip for now, use joins/selects.
+---
 
-### 2. Session store logic (port furnace store.ts)
-- [x] New `src/services/session.services.ts`.
-- [x] `createSession(userId, { cwd, title })` → insert, return row.
-- [x] `listSessions(userId)` → select where `userId`, `archivedAt is null`,
-      order by `updatedAt desc`.
-- [x] `getSession(id)` → one row.
-- [x] `appendEntry(sessionId, type, role, data)` → **the Pi rule** (furnace
-      store.ts:317): new entry's `parentEntryId = session.activeLeafId`, insert,
-      then `update session set activeLeafId = newEntry.id`. Do in a transaction.
-- [x] `getActivePath(sessionId)` (furnace store.ts:353): load all entries, walk
-      `parentEntryId` from `activeLeafId` up to root, reverse → the path the model sees.
-- [x] thin helpers: `appendMessage(role, content)`, `appendToolCall`, `appendToolResult`.
+## ✅ DONE
 
-### 3. GraphQL layer (kill the Todo demo)
-- [x] Install a JSON scalar: `npm i graphql-scalars` (for `Entry.data`).
-- [x] In `src/lib/types.ts` replace Todo typeDefs with: `Session`, `Entry`
-      (start with `data: JSON` — skip the typed union for now), `Query { sessions,
-      session(id), activePath(sessionId) }`, `Mutation { createSession, sendMessage }`.
-- [x] Resolvers call the session services from step 2.
-- [x] Apollo already mounted at `/graphql` in `index.ts` — no new wiring needed.
+### Auth (email + password, REST + JWT)
+Signup/login → JWT → `requireAuth`. See `claude_session.md`.
 
-### 4. Bridge JWT → GraphQL context (auth in resolvers)
-- [x] In `index.ts`, give `expressMiddleware(apserver, { context })` a `context` fn:
-      read `Authorization: Bearer`, `verifyToken()` (reuse `src/utils/jwt.ts`) →
-      return `{ userId }`.
-- [x] Resolvers read `ctx.userId` to scope sessions (your chats vs mine).
-      *(+ `requireUser` guard + `requireOwnedSession` — 401/403/404. HARDCODED_USER gone.)*
-- [x] Reuse logic, not the express `requireAuth` (that's for REST routes).
+### Sessions / Chats (data layer + GraphQL, tested vs Neon)
+- [x] Tables `sessions` + `entries` (1:1 furnace, `data` = jsonb), live in Neon.
+- [x] Store logic: `createSession`, `listSessions`, `getSession`, `appendEntry`
+      (Pi-rule + txn), `getActivePath`, thin helpers.
+- [x] GraphQL: `Session`/`Entry`, `JSON`+`DateTime` scalars, Query/Mutation.
+- [x] JWT → context (`requireUser` + `requireOwnedSession`, 401/403/404).
+- [x] Echo turn proved the tree end-to-end; batched into 1 txn (~13 → ~7 round-trips).
+- [x] `neon-http` → `neon-serverless` (transactions need a WS connection).
 
-### 5. sendMessage (echo — NO LLM yet)
-- [x] `sendMessage(sessionId, content)` mutation: `appendMessage("user", content)`
-      → then append a fake assistant entry (e.g. `"echo: " + content`) → return entries.
-- [x] Goal: prove entry-tree + `activePath` end-to-end over GraphQL before real AI.
-      *(tested vs real Neon: 2 turns → clean 4-node chain, activeLeafId correct.)*
+### LLM integration + Streaming (OpenRouter, real replies over WS)
+- [x] **1. OpenRouter setup** — `OPENROUTER_API_KEY` + `OPENROUTER_MODEL`
+      (`anthropic/claude-sonnet-4.5`) in `.env`; `npm i openai`.
+- [x] **2. System prompt** — furnace's real `base-system.md` + `title-system.md`
+      copied into `src/prompts/`, loaded by `src/lib/systemPrompt.ts`.
+- [x] **3. Provider service** — `src/services/llm.services.ts`: `chat()` (non-stream),
+      `chatStream()` (async generator), `generateTitle()` (furnace title logic).
+- [x] **4. Models query** — `Query { models }` returns a curated list (client picker).
+- [x] **5. activePath → messages** — `src/lib/buildMessages.ts` prepends SYSTEM_PROMPT.
+- [x] **6. Real turn (SPLIT txns)** — `runStreamingTurn`: user append (txn) → LLM
+      stream (outside txn) → assistant append (txn) + `data.model`; async LLM title-gen.
+- [x] **7. Streaming delivery** — `graphql-ws` WS server on `/graphql` + in-memory
+      `PubSub`; `Subscription { tokenStream(sessionId) }`; `sendMessage` is fire-and-stream.
+- [x] Tested end-to-end: tokens streamed live, assistant persisted, LLM title generated.
 
 ---
 
 ## ⚪ LATER (titles only — flesh out when we reach them)
 
-- [ ] LLM integration (OpenRouter — real assistant replies, non-streaming first)
-- [ ] Streaming (Redis Pub/Sub + GraphQL subscriptions — `tokenStream`)
-- [ ] Tool dispatch to device (`toolDispatch` / `submitToolResult`)
+- [ ] Tool dispatch to device (`toolDispatch` / `submitToolResult`)  ← likely next
+- [ ] Redis PubSub (swap in-memory PubSub → Redis for multi-process streaming)
 - [ ] Projects / Devices scoping
 - [ ] Branching & forking (`switchBranch`, `forkSession`)
 - [ ] Compaction (context window management)
@@ -73,3 +54,4 @@ The chat data layer + making GraphQL real. Sits on furnace's entry-tree
 - [ ] OAuth (GitHub login via `ASWebAuthenticationSession`)
 - [ ] Skills / Tasks (subagents)
 - [ ] Convert `docs/ARCHITECTURE.md` schema from Prisma syntax → Drizzle
+- [ ] Prod: copy `src/prompts/*.md` → `dist/` in the build step (tsc doesn't copy .md)
