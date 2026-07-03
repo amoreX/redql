@@ -8,9 +8,11 @@ import {
   type Entry,
   type NewEntry,
 } from "../db/schema.js";
-import { pubsub, tokensTopic } from "../lib/pubsub.js";
-import { chatStream, generateTitle, DEFAULT_MODEL } from "./llm.services.js";
+import { pubsub, tokensTopic, toolTopic } from "../lib/pubsub.js";
+import { streamAgent, generateTitle, DEFAULT_MODEL } from "./llm.services.js";
 import { buildMessages } from "../lib/buildMessages.js";
+import { TOOL_DEFS } from "../lib/tools.js";
+import { waitForToolResult, resolveToolResult } from "../lib/toolWaiters.js";
 
 export const createSession = async (
   userId: string,
@@ -117,26 +119,26 @@ export const appendToolResult = (
 ): Promise<Entry> =>
   appendEntry({ sessionId, type: "tool_result", role: "tool", data });
 
-// The real streaming turn. SPLIT from the echo: user append (txn) → LLM stream
-// (OUTSIDE any txn) → assistant append (txn). Tokens are published to the
-// session's pubsub topic as they arrive; the tokenStream subscription relays them.
-// Returns the USER entry immediately (fire-and-stream); the assistant arrives
-// over the subscription and is persisted when the stream completes.
-export const runStreamingTurn = async (
+// The agent turn: append the user msg, then LOOP — stream the model (with tools),
+// and whenever it emits tool calls, dispatch each to the DEVICE, PARK the loop
+// until the device submits the result, append it, and loop again. Ends when the
+// model replies with plain text (no tool calls). All LLM/tool work runs OUTSIDE
+// any transaction; only the individual appendEntry writes are transactional.
+// Returns the USER entry immediately (fire-and-stream).
+export const runAgentTurn = async (
   sessionId: string,
   userId: string,
   content: string,
   model: string = DEFAULT_MODEL,
 ): Promise<Entry> => {
-  // ownership + existence (one read)
   const session = await getSession(sessionId);
   if (!session) throw new Error("SESSION_NOT_FOUND");
   if (session.userId !== userId) throw new Error("SESSION_FORBIDDEN");
 
-  // txn1: persist the user message (moves the tip)
+  // persist the user message (moves the tip)
   const userEntry = await appendMessage(sessionId, "user", content);
 
-  // first message → generate a real title (async, don't block the stream)
+  // first message → title (async, non-blocking)
   if (session.title === "New chat") {
     void generateTitle(content)
       .then((title) =>
@@ -145,42 +147,84 @@ export const runStreamingTurn = async (
       .catch(() => {});
   }
 
-  // build model input from the full path (system + convo, ends with the user msg)
-  const path = await getActivePath(sessionId);
-  const messages = buildMessages(path);
+  const publishToken = (delta: string, done: boolean, entryId: string | null) =>
+    pubsub.publish(tokensTopic(sessionId), {
+      tokenStream: { sessionId, delta, done, entryId },
+    });
 
-  // fire-and-stream: NOT awaited. publish deltas as they arrive, persist the
-  // assistant entry when done, then publish the final done event.
+  // fire-and-stream: run the loop async, return the user entry now.
   void (async () => {
-    let full = "";
     try {
-      for await (const delta of chatStream(messages, model)) {
-        full += delta;
-        pubsub.publish(tokensTopic(sessionId), {
-          tokenStream: { sessionId, delta, done: false, entryId: null },
-        });
-      }
-      // txn2: persist the complete assistant reply (+ which model produced it)
-      const asst = await appendEntry({
-        sessionId,
-        type: "message",
-        role: "assistant",
-        data: { content: full, model },
-      });
-      pubsub.publish(tokensTopic(sessionId), {
-        tokenStream: { sessionId, delta: "", done: true, entryId: asst.id },
-      });
-    } catch (err) {
-      pubsub.publish(tokensTopic(sessionId), {
-        tokenStream: {
+      const MAX_STEPS = 20; // safety cap against runaway tool loops
+      for (let step = 0; step < MAX_STEPS; step++) {
+        const path = await getActivePath(sessionId);
+        const messages = buildMessages(path);
+
+        let text = "";
+        let toolCalls: {
+          toolCallId: string;
+          name: string;
+          arguments: string;
+        }[] = [];
+
+        for await (const ev of streamAgent(messages, model, TOOL_DEFS)) {
+          if (ev.type === "text") {
+            text += ev.delta;
+            publishToken(ev.delta, false, null); // live tokens to the client
+          } else if (ev.type === "tool_calls") {
+            toolCalls = ev.calls;
+          }
+        }
+
+        if (toolCalls.length > 0) {
+          for (const tc of toolCalls) {
+            // persist tool_call → dispatch to device → PARK until result comes back
+            await appendToolCall(sessionId, {
+              name: tc.name,
+              arguments: tc.arguments,
+              toolCallId: tc.toolCallId,
+            });
+            publishToken(`\n[tool: ${tc.name}]\n`, false, null);
+            pubsub.publish(toolTopic(sessionId), {
+              toolDispatch: {
+                sessionId,
+                toolCallId: tc.toolCallId,
+                name: tc.name,
+                arguments: tc.arguments,
+              },
+            });
+            const result = await waitForToolResult(tc.toolCallId); // blocks
+            await appendToolResult(sessionId, {
+              name: tc.name,
+              content: result,
+              toolCallId: tc.toolCallId,
+            });
+          }
+          continue; // loop again — the model now sees the tool results
+        }
+
+        // no tool calls → final assistant message, end the turn
+        const asst = await appendEntry({
           sessionId,
-          delta: `\n[error: ${(err as Error).message}]`,
-          done: true,
-          entryId: null,
-        },
-      });
+          type: "message",
+          role: "assistant",
+          data: { content: text, model },
+        });
+        publishToken("", true, asst.id);
+        return;
+      }
+      publishToken("\n[stopped: too many tool steps]", true, null);
+    } catch (err) {
+      publishToken(`\n[error: ${(err as Error).message}]`, true, null);
     }
   })();
 
   return userEntry;
 };
+
+// Device calls this (via the submitToolResult mutation) to hand back a tool's
+// output. Wakes the parked loop. Returns false if nothing was waiting on that id.
+export const submitToolResult = (
+  toolCallId: string,
+  content: string,
+): boolean => resolveToolResult(toolCallId, content);

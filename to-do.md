@@ -5,10 +5,14 @@
 
 ---
 
-## 🟢 NOW: (next topic — pick one to elaborate)
+## 🟢 NOW: Redis PubSub
 
-Likely next: **Tool dispatch to device** (`toolDispatch` / `submitToolResult`) —
-the split-runtime piece where the model's tool calls run on the user's Mac.
+Swap the in-memory `PubSub` (`src/lib/pubsub.ts`) → Redis pub/sub so streaming +
+tool dispatch work across **multiple server processes** (horizontal scaling), not
+just one. Same resolver API (`asyncIterableIterator`), different transport.
+Note: the parked-promise registry (`toolWaiters.ts`) is also in-process — with
+multiple servers, the turn loop and the `submitToolResult` may land on different
+boxes, so that needs a cross-process story too (Redis, or sticky routing).
 
 ---
 
@@ -41,12 +45,21 @@ Signup/login → JWT → `requireAuth`. See `claude_session.md`.
       `PubSub`; `Subscription { tokenStream(sessionId) }`; `sendMessage` is fire-and-stream.
 - [x] Tested end-to-end: tokens streamed live, assistant persisted, LLM title generated.
 
+### Tool dispatch to device (split-runtime agent loop)
+- [x] Basic tools (`read`/`write`/`ls`/`grep`/`bash`) as OpenAI tool defs (`src/lib/tools.ts`).
+- [x] Agent LOOP (`runAgentTurn`): stream → tool_calls → dispatch → park → result → loop.
+- [x] `streamAgent` assembles streamed tool-call deltas; `buildMessages` rebuilds
+      tool_call/tool_result into OpenAI message format.
+- [x] `toolDispatch` subscription (server→device) + `submitToolResult` mutation (device→server).
+- [x] Parked-promise registry (`src/lib/toolWaiters.ts`) keyed by toolCallId (+ timeout).
+- [x] `device-runner.mjs` — dev stand-in for the Swift app's bundled runner.
+- [x] Tested: model read package.json via the device, looped, answered;
+      tree = user → tool_call → tool_result → assistant.
+
 ---
 
 ## ⚪ LATER (titles only — flesh out when we reach them)
 
-- [ ] Tool dispatch to device (`toolDispatch` / `submitToolResult`)  ← likely next
-- [ ] Redis PubSub (swap in-memory PubSub → Redis for multi-process streaming)
 - [ ] Projects / Devices scoping
 - [ ] Branching & forking (`switchBranch`, `forkSession`)
 - [ ] Compaction (context window management)

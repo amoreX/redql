@@ -1,7 +1,7 @@
 {
-  "name": "appback",
+  "name": "redql",
   "version": "1.0.0",
-  "description": "",
+  "description": "A scaffold for a durable, streaming backend for AI agents — GraphQL + Redis, split-runtime tool dispatch.",
   "main": "dist/index.js",
   "scripts": {
     "dev": "nodemon --exec tsx src/index.ts",
@@ -36,9 +36,11 @@
     "drizzle-orm": "^1.0.0-rc.4",
     "express": "^5.2.1",
     "graphql": "^16.14.0",
+    "graphql-redis-subscriptions": "^2.7.0",
     "graphql-scalars": "^1.25.0",
     "graphql-subscriptions": "^3.0.0",
     "graphql-ws": "^6.0.8",
+    "ioredis": "^5.11.1",
     "jsonwebtoken": "^9.0.3",
     "morgan": "^1.11.0",
     "openai": "^6.45.0",

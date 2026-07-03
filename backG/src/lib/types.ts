@@ -5,9 +5,10 @@ import {
   listSessions,
   getSession,
   getActivePath,
-  runStreamingTurn,
+  runAgentTurn,
+  submitToolResult,
 } from "../services/sessions.services.js";
-import { pubsub, tokensTopic } from "./pubsub.js";
+import { pubsub, tokensTopic, toolTopic } from "./pubsub.js";
 
 // Curated model list for the client's picker (MVP). Don't let a client pick an
 // arbitrary/expensive model. (later: proxy OpenRouter /models.)
@@ -85,6 +86,13 @@ export const typeDefs = `#graphql
     entryId: ID
   }
 
+  type ToolCall {
+    sessionId: ID!
+    toolCallId: ID!
+    name: String!
+    arguments: String!
+  }
+
   type Query {
     sessions: [Session!]!
     session(id: ID!): Session
@@ -95,10 +103,12 @@ export const typeDefs = `#graphql
   type Mutation {
     createSession(cwd: String!, title: String): Session!
     sendMessage(sessionId: ID!, content: String!, model: String): Entry!
+    submitToolResult(sessionId: ID!, toolCallId: ID!, content: String!): Boolean!
   }
 
   type Subscription {
     tokenStream(sessionId: ID!): TokenChunk!
+    toolDispatch(sessionId: ID!): ToolCall!
   }
 `;
 
@@ -151,7 +161,7 @@ export const resolvers = {
     ) => {
       const userId = requireUser(ctx);
       try {
-        return await runStreamingTurn(sessionId, userId, content, model);
+        return await runAgentTurn(sessionId, userId, content, model);
       } catch (err) {
         const code = err instanceof Error ? err.message : "";
         if (code === "SESSION_NOT_FOUND")
@@ -164,6 +174,21 @@ export const resolvers = {
           });
         throw err;
       }
+    },
+
+    // Device hands back a tool's output → wakes the parked agent loop.
+    submitToolResult: async (
+      _parent: unknown,
+      {
+        sessionId,
+        toolCallId,
+        content,
+      }: { sessionId: string; toolCallId: string; content: string },
+      ctx: GqlContext,
+    ) => {
+      const userId = requireUser(ctx);
+      await requireOwnedSession(sessionId, userId);
+      return submitToolResult(toolCallId, content);
     },
   },
 
@@ -178,6 +203,19 @@ export const resolvers = {
         const userId = requireUser(ctx);
         await requireOwnedSession(sessionId, userId);
         return pubsub.asyncIterableIterator(tokensTopic(sessionId));
+      },
+    },
+
+    // The device subscribes to receive tool calls it must run locally.
+    toolDispatch: {
+      subscribe: async (
+        _parent: unknown,
+        { sessionId }: { sessionId: string },
+        ctx: GqlContext,
+      ) => {
+        const userId = requireUser(ctx);
+        await requireOwnedSession(sessionId, userId);
+        return pubsub.asyncIterableIterator(toolTopic(sessionId));
       },
     },
   },

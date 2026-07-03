@@ -63,18 +63,62 @@ function fallbackTitle(prompt: string): string {
   return sanitizeTitle(prompt.split(/\s+/).slice(0, 5).join(" ")) || "New Chat";
 }
 
-// Streaming: async generator yielding text deltas as they arrive from the model.
-export async function* chatStream(
-  messages: LLMMessage[],
+// A fully-assembled tool call the model asked for.
+export type ToolCallOut = {
+  toolCallId: string;
+  name: string;
+  arguments: string; // JSON string
+};
+
+// Events the agent stream emits: text deltas as they arrive, then (if any) the
+// assembled tool calls at the end of the response.
+export type AgentEvent =
+  | { type: "text"; delta: string }
+  | { type: "tool_calls"; calls: ToolCallOut[] };
+
+// Streaming WITH tools. Yields text deltas live; streamed tool-call fragments are
+// accumulated by index (id/name once, arguments concatenated) and emitted whole
+// at the end.
+export async function* streamAgent(
+  messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[],
   model: string = DEFAULT_MODEL,
-): AsyncGenerator<string> {
+  tools: OpenAI.Chat.Completions.ChatCompletionTool[] = [],
+): AsyncGenerator<AgentEvent> {
   const stream = await client.chat.completions.create({
     model,
     messages,
+    tools: tools.length ? tools : undefined,
     stream: true,
   });
+
+  const acc = new Map<number, { id: string; name: string; args: string }>();
+  let sawTools = false;
+
   for await (const chunk of stream) {
-    const delta = chunk.choices[0]?.delta?.content;
-    if (delta) yield delta;
+    const choice = chunk.choices[0];
+    if (!choice) continue;
+    const d = choice.delta;
+    if (d?.content) yield { type: "text", delta: d.content };
+    if (d?.tool_calls) {
+      sawTools = true;
+      for (const tc of d.tool_calls) {
+        const cur = acc.get(tc.index) ?? { id: "", name: "", args: "" };
+        if (tc.id) cur.id = tc.id;
+        if (tc.function?.name) cur.name = tc.function.name;
+        if (tc.function?.arguments) cur.args += tc.function.arguments;
+        acc.set(tc.index, cur);
+      }
+    }
+  }
+
+  if (sawTools) {
+    yield {
+      type: "tool_calls",
+      calls: [...acc.values()].map((a) => ({
+        toolCallId: a.id,
+        name: a.name,
+        arguments: a.args,
+      })),
+    };
   }
 }
