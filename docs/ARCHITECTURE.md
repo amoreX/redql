@@ -1,17 +1,37 @@
-# furnace-app — Architecture & Schema Design
+# redql — Architecture & Design Notes
 
-A ChatGPT-style **native macOS desktop app for the [furnace](../../furnace)
-harness** — the local-first terminal AI coding agent.
+The **full-vision** design for a ChatGPT-style desktop client + cloud brain for the
+[furnace](../../furnace) terminal agent. This doc is **aspirational** — "how the whole
+thing *could* be built." The actual scaffold (`redql`) implements the **core backend
+pipeline** and deliberately diverges from this doc in several specifics.
 
-This is a **recommendation / suggestion** doc — how the thing *should* be built.
-It describes the data model, GraphQL API shape, Redis usage, the split-runtime
-execution model, hosting, and a build plan. No code files — you build it.
+> ### ⚠️ Status: vision doc vs. what shipped
+> **Source of truth for what actually exists = [README.md](../README.md) + the code.**
+> Read *this* doc for the north-star design and the parts **not yet built** (branching,
+> projects/devices, compaction, the native client).
+>
+> **Where `redql` diverged from this doc:**
+>
+> | This doc says | What `redql` actually built |
+> |---|---|
+> | **Prisma** ORM | **Drizzle** ORM (Neon `neon-serverless` driver) |
+> | User/Device/Project/Session/Entry/ToolGrant/Task/Skill | **users / sessions / entries only** (rest = TODO) |
+> | GitHub **OAuth** (`ASWebAuthenticationSession`) | **email + password → JWT** |
+> | Native **SwiftUI** app + bundled TS tool runner | **`device-runner.mjs`** (node) as the device stand-in |
+> | `Timestamp` / `BigInt` epoch-ms columns | **`timestamp` (DateTime)** columns |
+> | furnace's ~15 tools | **5 basic**: `read` / `write` / `ls` / `grep` / `bash` |
+> | typed `EntryData` union | **`data: JSON`** scalar (union = TODO) |
+> | tool-result wait keyed in Redis | **in-memory** parked promise (streaming pub/sub *is* on Redis; this isn't yet) |
+>
+> **What held up exactly as designed:** the **split-runtime execution model (§2 —
+> brain in cloud, tools on device)** and the **entry-tree session model (§1)**. Both
+> were built as described. There is **no server-side sandbox** — in the design *or*
+> the build; tools run on the device.
 
-> **Client is a native macOS app (Swift / SwiftUI), not a web app.** This single
-> fact changes the central design decision (see §2): because the client already
-> runs on the user's machine, tools execute **on the device** and there is **no
-> server-side sandbox**. The agent's *brain* runs in the backend; its *hands* run
-> on the Mac.
+> **Original framing (still the intended end state):** client is a native macOS app
+> (Swift / SwiftUI), not a web app. Because the client already runs on the user's
+> machine, tools execute **on the device** — the agent's *brain* runs in the backend,
+> its *hands* on the Mac.
 
 ---
 
@@ -43,7 +63,7 @@ facts that shape furnace-app:
 
 | Concern | furnace (terminal) | furnace-app | 
 |---|---|---|
-| Store | local SQLite | **Postgres/Prisma** (backend) |
+| Store | local SQLite | **Postgres/Drizzle** (backend) |
 | Agent loop / provider / compaction | local process | **backend** (unchanged logic) |
 | Filesystem + bash tools | local process | **the user's Mac, via the app** |
 | `process.cwd()` | terminal cwd | a **local folder the user picks** |
@@ -127,7 +147,7 @@ byte identical to furnace and avoids a second implementation drifting out of syn
 │  - LOCAL TOOL EXECUTOR│◀──────────────────────── │  - auth, sessions, entries   │
 │    (bundled TS runner)│   subscriptions (WS):    │  - drives agent turns (BRAIN)│
 │  - native perm prompts│   tokens · entries ·     │  - furnace runtime           │
-│  - Keychain auth      │   TOOL-CALL DISPATCH     │  - Prisma                    │
+│  - Keychain auth      │   TOOL-CALL DISPATCH     │  - Drizzle                   │
 └──────────┬────────────┘                          └───┬──────────┬───────────────┘
            │ executes tools on                         │          │
            │ the user's Mac (FS + bash),     publishes │  reads / │
@@ -146,7 +166,7 @@ byte identical to furnace and avoids a second implementation drifting out of syn
   executor**. Talks to the backend with **Apollo iOS** (queries/mutations over
   HTTP, subscriptions + tool dispatch over WebSocket). No browser ⇒ **no CORS**.
 - **API server** (`backG/`, Express 5 + Apollo, **long-lived**): GraphQL over HTTP
-  + WebSocket. Owns auth, the DB via Prisma, and **runs the furnace agent loop**.
+  + WebSocket. Owns auth, the DB via Drizzle, and **runs the furnace agent loop**.
 - **furnace runtime (backend)**: the refactored furnace agent loop, run server-side
   per session, with its store pointed at **Postgres** and its tool executor pointed
   at the **connected device** (the remote executor) instead of local `fs`.
@@ -156,7 +176,7 @@ byte identical to furnace and avoids a second implementation drifting out of syn
 
 ---
 
-## 4. Data model (Postgres / Prisma) — suggested
+## 4. Data model (Postgres / Drizzle) — suggested
 
 Mirror furnace's entry-tree and add multi-user scoping. Suggested entities:
 `User`, `Project` (a workspace = a **local folder on the user's Mac**), `Session`,
@@ -192,6 +212,12 @@ Design choices:
 The `Session` / `Entry` models below are the **furnace `sessions` / `entries`
 tables, column-for-column**, with multi-user scoping added. Source of truth:
 furnace's `store.ts` migration (table DDL) and `types.ts` (the `data` shapes).
+
+> **What actually shipped:** the block below is **Prisma syntax** and the *full* vision
+> (User/Device/Project/ToolGrant + `BigInt` epoch-ms + typed union). `redql` built a
+> **Drizzle** subset — `users` / `sessions` / `entries` with `timestamp` columns and a
+> `jsonb` `data` blob. The **entry columns + Pi-rule tree are identical**; the extras
+> (Device/Project/ToolGrant/Task/Skill) are not built yet. Real schema: `backG/src/db/schema.ts`.
 
 ```prisma
 // ─── Identity & scoping — NEW in furnace-app (furnace has none of this) ───
