@@ -5,6 +5,7 @@ import {
   listSessions,
   getSession,
   getActivePath,
+  getPendingToolCalls,
   runAgentTurn,
   submitToolResult,
 } from "../services/sessions.services.js";
@@ -206,7 +207,12 @@ export const resolvers = {
       },
     },
 
-    // The device subscribes to receive tool calls it must run locally.
+    // The device subscribes to receive tool calls it must run locally. On
+    // (re)subscribe we REPLAY any already-dispatched-but-unanswered tool calls
+    // first, then stream live ones. Plain pub/sub drops messages to absent
+    // subscribers, so without the replay a device that connects (or reconnects)
+    // after a dispatch was published would never see it and the turn would hang
+    // until timeout.
     toolDispatch: {
       subscribe: async (
         _parent: unknown,
@@ -215,7 +221,21 @@ export const resolvers = {
       ) => {
         const userId = requireUser(ctx);
         await requireOwnedSession(sessionId, userId);
-        return pubsub.asyncIterableIterator(toolTopic(sessionId));
+        const live = pubsub.asyncIterableIterator(toolTopic(sessionId));
+        const pending = await getPendingToolCalls(sessionId);
+        async function* replayThenLive() {
+          try {
+            for (const tc of pending) {
+              yield { toolDispatch: { sessionId, ...tc } };
+            }
+            yield* live;
+          } finally {
+            // tear down the pub/sub subscription even if we're cancelled during
+            // replay (before we start delegating to `live`).
+            await live.return?.(undefined);
+          }
+        }
+        return replayThenLive();
       },
     },
   },

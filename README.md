@@ -65,12 +65,15 @@ to watch the bus.
 (Pi rule + txn, `getActivePath`) · GraphQL API + `JSON`/`DateTime` scalars · LLM
 replies + LLM titles (OpenRouter) · **token streaming over Redis pub/sub** · **agent
 loop + tool dispatch** (`read`/`write`/`ls`/`grep`/`bash`, `toolDispatch` → device →
-`submitToolResult` → loop) + `device-runner.mjs`.
+`submitToolResult` → loop) + `device-runner.mjs` · **multi-process tool round-trip**
+(the result rendezvous is a Redis `result:*` pub/sub channel, not an in-process map,
+so `submitToolResult` wakes the loop across processes) · **pending-dispatch replay**
+(`toolDispatch` re-sends unanswered tool calls on (re)subscribe, so a late/reconnecting
+device doesn't strand the turn).
 
-**TODO (scaffold):** `toolWaiters` still in-memory (move to a Redis `result:*` channel
-for multi-process) · caching (cache-aside, designed not built) · Redis Streams
-(buffered streaming — plain pub/sub misses tokens if you subscribe late) · real client
-(the `app/` React scaffold is abandoned) · branching/forking, compaction,
+**TODO (scaffold):** caching (cache-aside, designed not built) · Redis Streams for
+**token** streaming (plain pub/sub still misses tokens if you subscribe mid-turn) ·
+real client (the `app/` React scaffold is abandoned) · branching/forking, compaction,
 projects/devices, OAuth, per-tool permission prompts.
 
 ## Layout

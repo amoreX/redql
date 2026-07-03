@@ -10,9 +10,13 @@ import {
 } from "../db/schema.js";
 import { pubsub, tokensTopic, toolTopic } from "../lib/pubsub.js";
 import { streamAgent, generateTitle, DEFAULT_MODEL } from "./llm.services.js";
-import { buildMessages } from "../lib/buildMessages.js";
+import {
+  buildMessages,
+  toolCallMessage,
+  toolResultMessage,
+} from "../lib/buildMessages.js";
 import { TOOL_DEFS } from "../lib/tools.js";
-import { waitForToolResult, resolveToolResult } from "../lib/toolWaiters.js";
+import { parkToolResult, resolveToolResult } from "../lib/toolWaiters.js";
 
 export const createSession = async (
   userId: string,
@@ -35,7 +39,11 @@ export const listSessions = async (userId: string): Promise<Session[]> => {
   return rows;
 };
 
-export const getSession = async (sessionId: string): Promise<Session> => {
+// undefined when no session has that id — callers guard on it (requireOwnedSession,
+// runAgentTurn) and turn it into a 404 / SESSION_NOT_FOUND.
+export const getSession = async (
+  sessionId: string,
+): Promise<Session | undefined> => {
   const row = await db
     .select()
     .from(sessions)
@@ -100,6 +108,38 @@ export const getActivePath = async (sessionId: string): Promise<Entry[]> => {
   return path.reverse();
 };
 
+// Tool calls on the active path with no matching tool_result yet — i.e. dispatched
+// but unanswered. Used to REPLAY in-flight dispatches to a device that (re)subscribes
+// AFTER the dispatch was published: plain pub/sub drops messages to absent
+// subscribers, so without this a reconnecting device would never see the pending
+// tool and the turn would hang until the 120s timeout.
+export const getPendingToolCalls = async (
+  sessionId: string,
+): Promise<{ toolCallId: string; name: string; arguments: string }[]> => {
+  const path = await getActivePath(sessionId);
+  const answered = new Set<string>();
+  for (const e of path) {
+    if (e.type === "tool_result") {
+      const d = e.data as { toolCallId?: string };
+      if (d.toolCallId) answered.add(d.toolCallId);
+    }
+  }
+  const pending: { toolCallId: string; name: string; arguments: string }[] = [];
+  for (const e of path) {
+    if (e.type === "tool_call") {
+      const d = e.data as { toolCallId: string; name: string; arguments: string };
+      if (!answered.has(d.toolCallId)) {
+        pending.push({
+          toolCallId: d.toolCallId,
+          name: d.name,
+          arguments: d.arguments,
+        });
+      }
+    }
+  }
+  return pending;
+};
+
 export const appendMessage = (
   sessionId: string,
   role: "user" | "assistant",
@@ -155,11 +195,14 @@ export const runAgentTurn = async (
   // fire-and-stream: run the loop async, return the user entry now.
   void (async () => {
     try {
+      // Build the OpenAI transcript ONCE from the DB, then extend it in memory as
+      // the loop appends tool calls/results below. (Previously this re-read every
+      // entry in the session from Postgres on each step — up to MAX_STEPS times
+      // per turn — even though we already know exactly what we just appended.)
+      const messages = buildMessages(await getActivePath(sessionId));
+
       const MAX_STEPS = 20; // safety cap against runaway tool loops
       for (let step = 0; step < MAX_STEPS; step++) {
-        const path = await getActivePath(sessionId);
-        const messages = buildMessages(path);
-
         let text = "";
         let toolCalls: {
           toolCallId: string;
@@ -177,13 +220,26 @@ export const runAgentTurn = async (
         }
 
         if (toolCalls.length > 0) {
+          // NOTE: tool calls within one turn run SERIALLY here — dispatch one,
+          // wait for its result, then the next. Simple and safe, and fine for
+          // normal use. To let the device run independent calls concurrently,
+          // parallelize this loop (park + dispatch all, then await them together);
+          // left as a deliberate, configurable choice because it trades this
+          // simplicity for throughput and requires the device runner to handle
+          // concurrent tool execution.
           for (const tc of toolCalls) {
-            // persist tool_call → dispatch to device → PARK until result comes back
+            // persist tool_call → PARK for the result (subscribe FIRST) → THEN
+            // dispatch to device. Parking before dispatch closes the race where a
+            // result could arrive before we're listening.
             await appendToolCall(sessionId, {
               name: tc.name,
               arguments: tc.arguments,
               toolCallId: tc.toolCallId,
             });
+            // mirror the persisted tool_call into the in-memory transcript (same
+            // shape buildMessages would rebuild from the DB row).
+            messages.push(toolCallMessage(tc));
+            const { result: resultP } = await parkToolResult(tc.toolCallId);
             publishToken(`\n[tool: ${tc.name}]\n`, false, null);
             pubsub.publish(toolTopic(sessionId), {
               toolDispatch: {
@@ -193,12 +249,13 @@ export const runAgentTurn = async (
                 arguments: tc.arguments,
               },
             });
-            const result = await waitForToolResult(tc.toolCallId); // blocks
+            const result = await resultP; // blocks until the device submits
             await appendToolResult(sessionId, {
               name: tc.name,
               content: result,
               toolCallId: tc.toolCallId,
             });
+            messages.push(toolResultMessage({ toolCallId: tc.toolCallId, content: result }));
           }
           continue; // loop again — the model now sees the tool results
         }
@@ -227,4 +284,4 @@ export const runAgentTurn = async (
 export const submitToolResult = (
   toolCallId: string,
   content: string,
-): boolean => resolveToolResult(toolCallId, content);
+): Promise<boolean> => resolveToolResult(toolCallId, content);

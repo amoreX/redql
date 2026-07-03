@@ -5,18 +5,28 @@
 
 ---
 
-## 🟢 NOW: Redis PubSub
+## 🟢 NOW: Redis Streams for token streaming (buffered)
 
-Swap the in-memory `PubSub` (`src/lib/pubsub.ts`) → Redis pub/sub so streaming +
-tool dispatch work across **multiple server processes** (horizontal scaling), not
-just one. Same resolver API (`asyncIterableIterator`), different transport.
-Note: the parked-promise registry (`toolWaiters.ts`) is also in-process — with
-multiple servers, the turn loop and the `submitToolResult` may land on different
-boxes, so that needs a cross-process story too (Redis, or sticky routing).
+`tokenStream` is still plain Redis pub/sub — a client that subscribes *after* a
+turn starts misses the tokens already sent. Move token streaming to a Redis Stream
+(`XADD`/`XREAD`) so a late/reconnecting client can replay from where it left off.
+(Tool **dispatch** no longer has this problem — see the replay note in DONE.)
 
 ---
 
 ## ✅ DONE
+
+### Redis pub/sub — multi-process fan-out (streaming + tool round-trip)
+- [x] `src/lib/pubsub.ts` uses `RedisPubSub` (not in-memory) → `tokenStream` +
+      `toolDispatch` fan out across multiple server processes. Same resolver API.
+- [x] **Tool-result rendezvous moved off the in-process Map → Redis** (`toolWaiters.ts`):
+      the loop parks by SUBSCRIBEing to `result:{toolCallId}` before dispatch;
+      `submitToolResult` PUBLISHes there, so it wakes the loop even if it lands on a
+      different process behind a load balancer. (Was the last thing making
+      "multi-process" a lie.)
+- [x] **`toolDispatch` replays pending calls on (re)subscribe** (`getPendingToolCalls`
+      + generator in the resolver): a device connecting after a dispatch was
+      published still gets it, instead of the turn hanging until the 120s timeout.
 
 ### Auth (email + password, REST + JWT)
 Signup/login → JWT → `requireAuth`. See `claude_session.md`.

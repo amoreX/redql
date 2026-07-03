@@ -1,41 +1,69 @@
-// Parked-promise registry. The agent loop AWAITS a tool result that arrives via a
-// SEPARATE request (submitToolResult) from the device. This bridges the two:
-// the loop parks a promise keyed by toolCallId; submitToolResult resolves it.
+// Cross-process tool-result rendezvous over Redis pub/sub.
+//
+// The agent loop parks a waiter for a toolCallId; the device's submitToolResult —
+// which behind a load balancer may land on a DIFFERENT server process — publishes
+// the result over Redis, which delivers it to whichever process is actually
+// running the loop. This replaces the old in-process Map, which silently dropped
+// the result whenever the two requests hit different processes (so "Redis pub/sub
+// is in" no longer lies about multi-process: the tool round-trip is on Redis too).
+//
+// Ordering: the loop SUBSCRIBEs (awaited) BEFORE the tool is dispatched, so a
+// result can never be published before we're listening.
 
-type Waiter = { resolve: (content: string) => void; reject: (err: Error) => void };
+import { createRedis } from "./redis.js";
 
-const waiters = new Map<string, Waiter>();
+const CHANNEL_PREFIX = "result:";
+const channelFor = (toolCallId: string) => `${CHANNEL_PREFIX}${toolCallId}`;
 
-// The loop calls this and awaits — blocks until the device submits the result
-// (or times out so a dead device can't hang the turn forever).
-export function waitForToolResult(
+// One connection in subscriber mode (parked loops), one normal connection to
+// publish results. A subscriber-mode connection can't run ordinary commands, so
+// they must be separate.
+const sub = createRedis();
+const pub = createRedis();
+
+// toolCallId → resolver, for the calls THIS process is currently awaiting.
+const handlers = new Map<string, (content: string) => void>();
+
+sub.on("message", (channel, message) => {
+  const id = channel.slice(CHANNEL_PREFIX.length);
+  handlers.get(id)?.(message);
+});
+
+// Park for a tool's result. Subscribes FIRST (awaited) and returns once we're
+// listening; the returned `.result` promise resolves when the device submits the
+// result (or rejects on timeout so a dead device can't hang the turn forever).
+// Call this BEFORE dispatching the tool so no result can slip past us.
+export async function parkToolResult(
   toolCallId: string,
   timeoutMs = 120_000,
-): Promise<string> {
-  return new Promise((resolve, reject) => {
+): Promise<{ result: Promise<string> }> {
+  await sub.subscribe(channelFor(toolCallId)); // listening before dispatch
+  const result = new Promise<string>((resolve, reject) => {
+    const cleanup = () => {
+      handlers.delete(toolCallId);
+      void sub.unsubscribe(channelFor(toolCallId));
+    };
     const timer = setTimeout(() => {
-      waiters.delete(toolCallId);
+      cleanup();
       reject(new Error(`tool result timeout (${toolCallId})`));
     }, timeoutMs);
-    waiters.set(toolCallId, {
-      resolve: (c) => {
-        clearTimeout(timer);
-        resolve(c);
-      },
-      reject: (e) => {
-        clearTimeout(timer);
-        reject(e);
-      },
+    handlers.set(toolCallId, (content) => {
+      clearTimeout(timer);
+      cleanup();
+      resolve(content);
     });
   });
+  return { result };
 }
 
-// submitToolResult calls this → wakes the parked loop. Returns false if no one
-// was waiting for that id (unknown/expired).
-export function resolveToolResult(toolCallId: string, content: string): boolean {
-  const w = waiters.get(toolCallId);
-  if (!w) return false;
-  waiters.delete(toolCallId);
-  w.resolve(content);
-  return true;
+// Called by submitToolResult on ANY process → wakes the parked loop wherever it
+// lives. PUBLISH returns the number of subscribers that received the message, so
+// we still report whether a loop was actually waiting (0 → unknown/expired id) —
+// now across processes instead of just this one's memory.
+export async function resolveToolResult(
+  toolCallId: string,
+  content: string,
+): Promise<boolean> {
+  const receivers = await pub.publish(channelFor(toolCallId), content);
+  return receivers > 0;
 }

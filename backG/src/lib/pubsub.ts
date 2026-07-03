@@ -1,8 +1,8 @@
-import { PubSub } from "graphql-subscriptions";
 import { RedisPubSub } from "graphql-redis-subscriptions";
 import { createRedis } from "./redis.js";
-// In-memory pub/sub for streaming tokens. One topic per session. This is the
-// piece Redis replaces later (cross-process fan-out); the resolver API is the same.
+// Redis pub/sub for streaming tokens + tool dispatch. One topic per session.
+// Redis (not in-memory) so fan-out works across multiple server processes; the
+// resolver API (asyncIterableIterator) is identical either way.
 
 export const pubsub = new RedisPubSub({
   publisher: createRedis(),
